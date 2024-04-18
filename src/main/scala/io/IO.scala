@@ -5,7 +5,7 @@ import scala.util.Try
 
 sealed trait IO[A] {
   self =>
-  import io.IO.{Failure, FlatMap, Pure, RedeemWith, Suspended}
+  import io.IO.{Failure, FlatMap, Pure, RedeemWith, Suspended, unpackedDoubleCaughtRedeemWith}
   def map[B](f: A => B): IO[B] = flatMap(x => Pure(f(x)))
   def flatMap[B](f: A => IO[B]): IO[B] = FlatMap(self, f)
   def *>[B](another: IO[B]): IO[B] = flatMap(_ => another)
@@ -20,7 +20,14 @@ sealed trait IO[A] {
   def redeem[B](recover: Throwable => B, map: A => B): IO[B] =
     redeemWith(x => Pure(recover(x)), x => Pure(map(x)))
   def redeemWith[B](recover: Throwable => IO[B], bind: A => IO[B]): IO[B] = RedeemWith(self, recover, bind)
-  def syncStep: Either[() => IO[A], A] = self match {
+
+  @tailrec
+  final def unsafeRunSync(): A = syncStep match {
+    case Left(ns) => ns().unsafeRunSync()
+    case Right(v) => v
+  }
+
+  private def syncStep: Either[() => IO[A], A] = self match {
     case Pure(v)         => Right(v)
     case Suspended(call) => Left(call)
     case Failure(th)     => throw th
@@ -58,13 +65,8 @@ sealed trait IO[A] {
             )
           )
         case RedeemWith(sub2, rec2, bind2) =>
-          Left(() => RedeemWith(sub2, x => FlatMap(rec2(x), bind), { x: Any => FlatMap(bind2(x), bind) }))
+          unpackedDoubleCaughtRedeemWith(sub2, rec2, bind2, bind)
       }
-  }
-  @tailrec
-  final def unsafeRunSync(): A = syncStep match {
-    case Left(ns) => ns().unsafeRunSync()
-    case Right(v) => v
   }
 }
 
@@ -74,6 +76,14 @@ object IO {
   private final case class FlatMap[A, B](sub: IO[A], cont: A => IO[B]) extends IO[B]
   private final case class Failure[A](th: Throwable) extends IO[A]
   private final case class RedeemWith[A, B](sub: IO[A], recover: Throwable => IO[B], bind: A => IO[B]) extends IO[B]
+
+  private def unpackedDoubleCaughtRedeemWith[A](
+    sub: IO[Any],
+    rec: Throwable => IO[Any],
+    bind: Any => IO[Any],
+    cont: Any => IO[A]
+  ) =
+    Left(() => RedeemWith(sub, x => FlatMap(rec(x), cont), { x: Any => FlatMap(bind(x), cont) }))
 
   def apply[A](body: => A): IO[A] = delay(body)
   def suspend[A](thunk: => IO[A]): IO[A] = Suspended(() => thunk)
